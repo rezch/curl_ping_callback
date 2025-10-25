@@ -2,18 +2,20 @@
 #include <curl/curl.h>
 
 
-int pingframe_callback(CURL*, void*,
-                       int action)
+int ping_callback(CURL*, void*, int action)
 {
     switch (action) {
-    case CURL_PINGFRAME_SEND:
-        std::cout << "GOT: CURL_PINGFRAME_SEND\n";
+    case CURL_PING_SEND:
+        std::cout << "=====> GOT: CURL_PING_SEND\n";
         break;
-    case CURL_PINGFRAME_SENDERR:
-        std::cout << "GOT: CURL_PINGFRAME_SENDERR\n";
+    case CURL_PING_SENDERR:
+        std::cout << "=====> GOT: CURL_PING_SENDERR\n";
         return CURLE_PING_TIMEOUT;
-    case CURL_PINGFRAME_RECV:
-        std::cout << "GOT: CURL_PINGFRAME_RECV\n";
+    case CURL_PING_RECV:
+        std::cout << "=====> GOT: CURL_PING_RECV\n";
+        break;
+    case CURL_PING_RECVACK:
+        std::cout << "=====> GOT: CURL_PING_RECVACK\n";
         break;
     }
     return CURLE_OK;
@@ -31,8 +33,8 @@ int main()
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
-    curl_easy_setopt(curl, CURLOPT_UPKEEP_INTERVAL_MS, 1L);
-    curl_easy_setopt(curl, CURLOPT_PINGFRAME_FUNCTION, pingframe_callback);
+    curl_easy_setopt(curl, CURLOPT_UPKEEP_INTERVAL_MS, 0L);
+    curl_easy_setopt(curl, CURLOPT_PING_FUNCTION, ping_callback);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
 
     curl_easy_perform(curl);
