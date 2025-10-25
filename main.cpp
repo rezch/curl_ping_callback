@@ -3,7 +3,7 @@
 #include <thread>
 
 
-int ping_callback(CURL*, void*, int action)
+void ping_callback(CURL*, void*, int action)
 {
     const char* msg[] = {
         "CURL_PING_SEND",
@@ -14,7 +14,6 @@ int ping_callback(CURL*, void*, int action)
         "CURL_PING_CONNCLOSE",
     };
     std::cout << "=====> GOT: " << msg[action - 1] << "\n";
-    return CURLE_OK;
 }
 
 size_t write_callback(char*, size_t size, size_t nmemb, void*)
