@@ -1,5 +1,5 @@
 diff --git a/include/curl/curl.h b/include/curl/curl.h
-index 49552558d..86f3448bb 100644
+index 49552558d..3aba7312f 100644
 --- a/include/curl/curl.h
 +++ b/include/curl/curl.h
 @@ -645,6 +645,7 @@ typedef enum {
@@ -22,24 +22,51 @@ index 49552558d..86f3448bb 100644
    CURLOPT_LASTENTRY /* the last unused */
  } CURLoption;
  
-@@ -2647,6 +2653,17 @@ curl_formadd(struct curl_httppost **httppost,
+@@ -2647,6 +2653,19 @@ curl_formadd(struct curl_httppost **httppost,
  typedef size_t (*curl_formget_callback)(void *arg, const char *buf,
                                          size_t len);
  
-+#define CURL_PING_SEND     1
-+#define CURL_PING_SENDERR  2
-+#define CURL_PING_RECV     3
-+#define CURL_PING_RECVACK  4
++#define CURL_PING_SEND        1
++#define CURL_PING_SENDERR     2
++#define CURL_PING_RECV        3
++#define CURL_PING_RECVACK     4
++#define CURL_PING_CONNOPEN    5
++#define CURL_PING_CONNCLOSE   6
 +
 +/*
 + * callback function for ping frame send/recv
 + */
-+typedef int (*curl_ping_callback)(CURL *easy, void *userdata,
++typedef void (*curl_ping_callback)(CURL *easy, void *userdata,
 +                                       int action);
 +
  /*
   * NAME curl_formget()
   *
+diff --git a/lib/cfilters.c b/lib/cfilters.c
+index 07f3c5f7b..260909823 100644
+--- a/lib/cfilters.c
++++ b/lib/cfilters.c
+@@ -511,6 +511,7 @@ CURLcode Curl_conn_connect(struct Curl_easy *data,
+       cf_cntrl_update_info(data, data->conn);
+       conn_report_connect_stats(data, data->conn);
+       data->conn->keepalive = curlx_now();
++      data->set.fping_func(data, data->set.fping_userdata, CURL_PING_CONNOPEN);
+ #ifndef CURL_DISABLE_VERBOSE_STRINGS
+       result = cf_verboseconnect(data, cf);
+ #endif
+diff --git a/lib/conncache.c b/lib/conncache.c
+index 1393bb565..b3c45c6e9 100644
+--- a/lib/conncache.c
++++ b/lib/conncache.c
+@@ -696,6 +696,8 @@ void Curl_conn_terminate(struct Curl_easy *data,
+     Curl_cshutdn_terminate(cpool->idata, conn, !aborted);
+   }
+ 
++  data->set.fping_func(data, data->set.fping_userdata, CURL_PING_CONNCLOSE);
++
+   if(do_lock)
+     CPOOL_UNLOCK(cpool, data);
+ }
 diff --git a/lib/easyoptions.c b/lib/easyoptions.c
 index 03d676df0..c89be7216 100644
 --- a/lib/easyoptions.c
@@ -54,7 +81,7 @@ index 03d676df0..c89be7216 100644
    {"PIPEWAIT", CURLOPT_PIPEWAIT, CURLOT_LONG, 0},
    {"PORT", CURLOPT_PORT, CURLOT_LONG, 0},
 diff --git a/lib/http2.c b/lib/http2.c
-index c526bf0fa..77e4eac53 100644
+index c526bf0fa..0501901cf 100644
 --- a/lib/http2.c
 +++ b/lib/http2.c
 @@ -710,21 +710,26 @@ static CURLcode http2_send_ping(struct Curl_cfilter *cf,
@@ -69,7 +96,7 @@ index c526bf0fa..77e4eac53 100644
      failf(data, "nghttp2_submit_ping() failed: %s(%d)",
            nghttp2_strerror(rc), rc);
 -   return CURLE_HTTP2;
-+    (void)userd->fping_func(data, userd->fping_userdata, CURL_PING_SENDERR);
++    userd->fping_func(data, userd->fping_userdata, CURL_PING_SENDERR);
 +    return CURLE_HTTP2;
    }
  
@@ -77,11 +104,11 @@ index c526bf0fa..77e4eac53 100644
    if(rc) {
      failf(data, "nghttp2_session_send() failed: %s(%d)",
            nghttp2_strerror(rc), rc);
-+    (void)userd->fping_func(data, userd->fping_userdata, CURL_PING_SENDERR);
++    userd->fping_func(data, userd->fping_userdata, CURL_PING_SENDERR);
      return CURLE_SEND_ERROR;
    }
 +
-+  (void)userd->fping_func(data, userd->fping_userdata, CURL_PING_SEND);
++  userd->fping_func(data, userd->fping_userdata, CURL_PING_SEND);
    return CURLE_OK;
  }
  
@@ -107,7 +134,7 @@ index c526bf0fa..77e4eac53 100644
        break;
      }
 +    case NGHTTP2_PING:
-+      (void)userd->fping_func(data, userd->fping_userdata,
++      userd->fping_func(data, userd->fping_userdata,
 +                              CURL_PING_RECV
 +                              + (frame->hd.flags & NGHTTP2_FLAG_ACK));
 +      break;
