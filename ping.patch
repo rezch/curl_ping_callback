@@ -1,0 +1,146 @@
+diff --git a/include/curl/curl.h b/include/curl/curl.h
+index 49552558d..77a55eaaa 100644
+--- a/include/curl/curl.h
++++ b/include/curl/curl.h
+@@ -645,6 +645,7 @@ typedef enum {
+   CURLE_UNRECOVERABLE_POLL,      /* 99 - poll/select returned fatal error */
+   CURLE_TOO_LARGE,               /* 100 - a value/data met its maximum */
+   CURLE_ECH_REQUIRED,            /* 101 - ECH tried but failed */
++  CURLE_PING_TIMEOUT,            /* 102 - ping frame waiting timedout */
+   CURL_LAST /* never use! */
+ } CURLcode;
+ 
+@@ -2259,6 +2260,11 @@ typedef enum {
+   /* set TLS supported signature algorithms */
+   CURLOPT(CURLOPT_SSL_SIGNATURE_ALGORITHMS, CURLOPTTYPE_STRINGPOINT, 328),
+ 
++  /* Function that will be called when HTTP2 PING FRAME has been
++     sent or received */
++  CURLOPT(CURLOPT_PINGFRAME_FUNCTION, CURLOPTTYPE_FUNCTIONPOINT, 329),
++  CURLOPT(CURLOPT_PINGFRAME_DATA, CURLOPTTYPE_CBPOINT, 330),
++
+   CURLOPT_LASTENTRY /* the last unused */
+ } CURLoption;
+ 
+@@ -2647,6 +2653,16 @@ curl_formadd(struct curl_httppost **httppost,
+ typedef size_t (*curl_formget_callback)(void *arg, const char *buf,
+                                         size_t len);
+ 
++#define CURL_PINGFRAME_SEND     1
++#define CURL_PINGFRAME_RECV     2
++#define CURL_PINGFRAME_SENDERR  3
++
++/*
++ * callback function for ping frame send/recv
++ */
++typedef int (*curl_pingframe_callback)(CURL *easy, void *userdata,
++                                       int action);
++
+ /*
+  * NAME curl_formget()
+  *
+diff --git a/lib/easyoptions.c b/lib/easyoptions.c
+index 03d676df0..071106281 100644
+--- a/lib/easyoptions.c
++++ b/lib/easyoptions.c
+@@ -191,6 +191,8 @@ const struct curl_easyoption Curl_easyopts[] = {
+   {"OPENSOCKETFUNCTION", CURLOPT_OPENSOCKETFUNCTION, CURLOT_FUNCTION, 0},
+   {"PASSWORD", CURLOPT_PASSWORD, CURLOT_STRING, 0},
+   {"PATH_AS_IS", CURLOPT_PATH_AS_IS, CURLOT_LONG, 0},
++  {"PINGFRAME_FUNCTION", CURLOPT_PINGFRAME_FUNCTION, CURLOT_FUNCTION, 0},
++  {"PINGFRAME_DATA", CURLOPT_PINGFRAME_DATA, CURLOT_CBPTR, 0},
+   {"PINNEDPUBLICKEY", CURLOPT_PINNEDPUBLICKEY, CURLOT_STRING, 0},
+   {"PIPEWAIT", CURLOPT_PIPEWAIT, CURLOT_LONG, 0},
+   {"PORT", CURLOPT_PORT, CURLOT_LONG, 0},
+diff --git a/lib/http2.c b/lib/http2.c
+index c526bf0fa..150fc1afc 100644
+--- a/lib/http2.c
++++ b/lib/http2.c
+@@ -710,21 +710,26 @@ static CURLcode http2_send_ping(struct Curl_cfilter *cf,
+                                 struct Curl_easy *data)
+ {
+   struct cf_h2_ctx *ctx = cf->ctx;
++  struct UserDefined *userd = &data->set;
+   int rc;
+ 
+   rc = nghttp2_submit_ping(ctx->h2, 0, ZERO_NULL);
+   if(rc) {
+     failf(data, "nghttp2_submit_ping() failed: %s(%d)",
+           nghttp2_strerror(rc), rc);
+-   return CURLE_HTTP2;
++    (void)userd->fpingframe(data, userd->fpingframe_userdata, CURL_PINGFRAME_SENDERR);
++    return CURLE_HTTP2;
+   }
+ 
+   rc = nghttp2_session_send(ctx->h2);
+   if(rc) {
+     failf(data, "nghttp2_session_send() failed: %s(%d)",
+           nghttp2_strerror(rc), rc);
++    (void)userd->fpingframe(data, userd->fpingframe_userdata, CURL_PINGFRAME_SENDERR);
+     return CURLE_SEND_ERROR;
+   }
++
++  (void)userd->fpingframe(data, userd->fpingframe_userdata, CURL_PINGFRAME_SEND);
+   return CURLE_OK;
+ }
+ 
+@@ -1314,6 +1319,7 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
+   struct Curl_cfilter *cf = userp;
+   struct cf_h2_ctx *ctx = cf->ctx;
+   struct Curl_easy *data = CF_DATA_CURRENT(cf), *data_s;
++  struct UserDefined *userd = &data->set;
+   int32_t stream_id = frame->hd.stream_id;
+ 
+   DEBUGASSERT(data);
+@@ -1358,6 +1364,13 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
+       }
+       break;
+     }
++    case NGHTTP2_PING:
++      if(userd->fpingframe(data, userd->fpingframe_userdata, CURL_PINGFRAME_RECV) != CURLE_PING_TIMEOUT) {
++        break;
++      }
++      infof(data, "ping frame receive timeout by user callback last_stream=%u",
++                  ctx->remote_max_sid);
++      FALLTHROUGH();
+     case NGHTTP2_GOAWAY:
+       ctx->rcvd_goaway = TRUE;
+       ctx->goaway_error = frame->goaway.error_code;
+diff --git a/lib/setopt.c b/lib/setopt.c
+index 3f628c443..d13807925 100644
+--- a/lib/setopt.c
++++ b/lib/setopt.c
+@@ -2178,6 +2178,10 @@ static CURLcode setopt_cptr(struct Curl_easy *data, CURLoption option,
+                                &s->str[STRING_INTERFACE],
+                                &s->str[STRING_BINDHOST]);
+ 
++  case CURLOPT_PINGFRAME_DATA:
++    s->fpingframe_userdata = ptr;
++    break;
++
+   case CURLOPT_PINNEDPUBLICKEY:
+     /*
+      * Set pinned public key for SSL connection.
+@@ -2765,6 +2769,9 @@ static CURLcode setopt_func(struct Curl_easy *data, CURLoption option,
+   case CURLOPT_PREREQFUNCTION:
+     s->fprereq = va_arg(param, curl_prereq_callback);
+     break;
++  case CURLOPT_PINGFRAME_FUNCTION:
++    s->fpingframe = va_arg(param, curl_pingframe_callback);
++    break;
+   default:
+     return CURLE_UNKNOWN_OPTION;
+   }
+diff --git a/lib/urldata.h b/lib/urldata.h
+index 3c7e634b0..f0aa02885 100644
+--- a/lib/urldata.h
++++ b/lib/urldata.h
+@@ -1345,6 +1345,8 @@ struct UserDefined {
+   void *prereq_userp; /* pre-initial request user data */
+ 
+   void *seek_client;    /* pointer to pass to the seek callback */
++  curl_pingframe_callback fpingframe; /* function for ping frame progress callback */
++  void *fpingframe_userdata;
+ #ifndef CURL_DISABLE_HSTS
+   curl_hstsread_callback hsts_read;
+   void *hsts_read_userp;
