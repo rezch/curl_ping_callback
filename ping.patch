@@ -43,26 +43,36 @@ index 49552558d..3aba7312f 100644
   * NAME curl_formget()
   *
 diff --git a/lib/cfilters.c b/lib/cfilters.c
-index 07f3c5f7b..260909823 100644
+index 07f3c5f7b..34d6ba684 100644
 --- a/lib/cfilters.c
 +++ b/lib/cfilters.c
-@@ -511,6 +511,7 @@ CURLcode Curl_conn_connect(struct Curl_easy *data,
+@@ -511,6 +511,12 @@ CURLcode Curl_conn_connect(struct Curl_easy *data,
        cf_cntrl_update_info(data, data->conn);
        conn_report_connect_stats(data, data->conn);
        data->conn->keepalive = curlx_now();
-+      data->set.fping_func(data, data->set.fping_userdata, CURL_PING_CONNOPEN);
++      if(data->set.fping_func) {
++        Curl_set_in_callback(data, TRUE);
++        data->set.fping_func(data, data->set.fping_userdata,
++                             CURL_PING_CONNOPEN);
++        Curl_set_in_callback(data, FALSE);
++      }
  #ifndef CURL_DISABLE_VERBOSE_STRINGS
        result = cf_verboseconnect(data, cf);
  #endif
 diff --git a/lib/conncache.c b/lib/conncache.c
-index 1393bb565..b3c45c6e9 100644
+index 1393bb565..45ed1da5e 100644
 --- a/lib/conncache.c
 +++ b/lib/conncache.c
-@@ -696,6 +696,8 @@ void Curl_conn_terminate(struct Curl_easy *data,
+@@ -696,6 +696,13 @@ void Curl_conn_terminate(struct Curl_easy *data,
      Curl_cshutdn_terminate(cpool->idata, conn, !aborted);
    }
  
-+  data->set.fping_func(data, data->set.fping_userdata, CURL_PING_CONNCLOSE);
++  if(data->set.fping_func) {
++    Curl_set_in_callback(data, TRUE);
++    data->set.fping_func(data, data->set.fping_userdata,
++                         CURL_PING_CONNCLOSE);
++    Curl_set_in_callback(data, FALSE);
++  }
 +
    if(do_lock)
      CPOOL_UNLOCK(cpool, data);
@@ -81,22 +91,23 @@ index 03d676df0..c89be7216 100644
    {"PIPEWAIT", CURLOPT_PIPEWAIT, CURLOT_LONG, 0},
    {"PORT", CURLOPT_PORT, CURLOT_LONG, 0},
 diff --git a/lib/http2.c b/lib/http2.c
-index c526bf0fa..0501901cf 100644
+index c526bf0fa..d1328884d 100644
 --- a/lib/http2.c
 +++ b/lib/http2.c
-@@ -710,21 +710,26 @@ static CURLcode http2_send_ping(struct Curl_cfilter *cf,
-                                 struct Curl_easy *data)
- {
-   struct cf_h2_ctx *ctx = cf->ctx;
-+  struct UserDefined *userd = &data->set;
-   int rc;
+@@ -463,6 +463,7 @@ static int h2_client_new(struct Curl_cfilter *cf,
+   return rc;
+ }
  
-   rc = nghttp2_submit_ping(ctx->h2, 0, ZERO_NULL);
++static void ping_callback(struct Curl_easy *easy, int action);
+ static ssize_t send_callback(nghttp2_session *h2,
+                              const uint8_t *mem, size_t length, int flags,
+                              void *userp);
+@@ -716,15 +717,19 @@ static CURLcode http2_send_ping(struct Curl_cfilter *cf,
    if(rc) {
      failf(data, "nghttp2_submit_ping() failed: %s(%d)",
            nghttp2_strerror(rc), rc);
 -   return CURLE_HTTP2;
-+    userd->fping_func(data, userd->fping_userdata, CURL_PING_SENDERR);
++    ping_callback(data, CURL_PING_SENDERR);
 +    return CURLE_HTTP2;
    }
  
@@ -104,39 +115,39 @@ index c526bf0fa..0501901cf 100644
    if(rc) {
      failf(data, "nghttp2_session_send() failed: %s(%d)",
            nghttp2_strerror(rc), rc);
-+    userd->fping_func(data, userd->fping_userdata, CURL_PING_SENDERR);
++    ping_callback(data, CURL_PING_SENDERR);
      return CURLE_SEND_ERROR;
    }
 +
-+  userd->fping_func(data, userd->fping_userdata, CURL_PING_SEND);
++  ping_callback(data, CURL_PING_SEND);
    return CURLE_OK;
  }
  
-@@ -1314,6 +1319,7 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
-   struct Curl_cfilter *cf = userp;
-   struct cf_h2_ctx *ctx = cf->ctx;
-   struct Curl_easy *data = CF_DATA_CURRENT(cf), *data_s;
-+  struct UserDefined *userd;
-   int32_t stream_id = frame->hd.stream_id;
+@@ -761,6 +766,16 @@ static CURLcode nw_out_flush(struct Curl_cfilter *cf,
+   return Curl_bufq_is_empty(&ctx->outbufq) ? CURLE_OK : CURLE_AGAIN;
+ }
  
-   DEBUGASSERT(data);
-@@ -1327,6 +1333,8 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
-   }
- #endif /* !CURL_DISABLE_VERBOSE_STRINGS */
- 
-+  userd = &data->set;
++static void ping_callback(struct Curl_easy *data, int action)
++{
++    if(data->set.fping_func) {
++      Curl_set_in_callback(data, TRUE);
++      data->set.fping_func(data, data->set.fping_userdata,
++                           action);
++      Curl_set_in_callback(data, FALSE);
++    }
++}
 +
-   if(!stream_id) {
-     /* stream ID zero is for connection-oriented stuff */
-     DEBUGASSERT(data);
-@@ -1358,6 +1366,11 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
+ /*
+  * The implementation of nghttp2_send_callback type. Here we write |data| with
+  * size |length| to the network and return the number of bytes actually
+@@ -1358,6 +1373,11 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
        }
        break;
      }
 +    case NGHTTP2_PING:
-+      userd->fping_func(data, userd->fping_userdata,
-+                              CURL_PING_RECV
-+                              + (frame->hd.flags & NGHTTP2_FLAG_ACK));
++      ping_callback(data,
++                    CURL_PING_RECV
++                    + (frame->hd.flags & NGHTTP2_FLAG_ACK));
 +      break;
      case NGHTTP2_GOAWAY:
        ctx->rcvd_goaway = TRUE;
